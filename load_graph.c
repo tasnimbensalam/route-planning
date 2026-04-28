@@ -744,40 +744,80 @@ typedef struct {
 
 
 /*
- * Sélection "farthest" des landmarks.
- * On maintient min_dist[v] = min sur les landmarks déjà choisis de d(ℓ, v).
- * À chaque itération, on prend l'argmax de min_dist comme nouveau landmark.
+ * Sélection "farthest" des landmarks, RESTREINTE à la plus grande
+ * composante connexe accessible.
  *
- * On utilise les distances FORWARD (depuis ℓ) pour la sélection ; ce
- * choix est arbitraire, l'important est juste d'éparpiller les landmarks.
+ * Pourquoi cette restriction ?
+ *   Un graphe routier OSM contient souvent de petites composantes
+ *   isolées (parkings privés, enclaves mal connectées, erreurs de
+ *   tagging). Si on tire le premier landmark dans une de ces micro-
+ *   composantes (ex. 10 nœuds), il ne peut atteindre que ces 10 nœuds
+ *   et l'heuristique ALT vaut 0 partout ailleurs → ALT ≡ Dijkstra.
+ *
+ * Algorithme :
+ *   1. BFS depuis un nœud "central" (on prend celui de plus haut degré
+ *      sortant comme heuristique simple — il est probablement dans la
+ *      grande composante). On marque tous les nœuds atteints.
+ *   2. On ne pioche les landmarks que parmi les nœuds atteints.
  */
 static void select_landmarks_farthest(const CSRGraph *g, int K,
                                       int *landmarks, unsigned seed) {
     int n = g->n_nodes;
+
+    /* ── Étape 1 : trouver la plus grande composante (par BFS) ── */
+    /* Heuristique : on part du nœud de plus haut degré sortant. Sur un
+     * graphe routier réel, ce nœud est forcément dans la grande
+     * composante (carrefour important). */
+    int seed_node = 0, max_deg = -1;
+    for (int v = 0; v < n; v++) {
+        int d = g->row_ptr[v + 1] - g->row_ptr[v];
+        if (d > max_deg) { max_deg = d; seed_node = v; }
+    }
+
+    char *in_main = calloc(n, sizeof(char));
+    int  *queue   = malloc(n * sizeof(int));
+    int qhead = 0, qtail = 0;
+    in_main[seed_node] = 1;
+    queue[qtail++] = seed_node;
+    while (qhead < qtail) {
+        int u = queue[qhead++];
+        for (int k = g->row_ptr[u]; k < g->row_ptr[u + 1]; k++) {
+            int v = g->adj[k];
+            if (!in_main[v]) { in_main[v] = 1; queue[qtail++] = v; }
+        }
+    }
+    int main_size = qtail;
+    printf("    [info] plus grande composante atteignable : %d / %d nœuds (%.1f%%)\n",
+           main_size, n, 100.0 * main_size / n);
+    free(queue);
+
+    /* On collecte les nœuds de la grande composante dans un tableau,
+     * pour pouvoir piocher facilement dedans. */
+    int *main_nodes = malloc(main_size * sizeof(int));
+    int idx = 0;
+    for (int v = 0; v < n; v++) if (in_main[v]) main_nodes[idx++] = v;
+
+    /* ── Étape 2 : sélection farthest dans la grande composante ── */
     double *min_dist = malloc(n * sizeof(double));
     double *tmp_dist = malloc(n * sizeof(double));
     for (int i = 0; i < n; i++) min_dist[i] = DBL_MAX;
 
-    /* Premier landmark : un nœud aléatoire (mais qui doit avoir au moins
-     * un voisin sortant, pour éviter un nœud isolé). */
     srand(seed);
-    int first;
-    do { first = rand() % n; }
-    while (g->row_ptr[first + 1] == g->row_ptr[first]);
+
+    /* Premier landmark : un nœud aléatoire DANS la grande composante */
+    int first = main_nodes[rand() % main_size];
     landmarks[0] = first;
 
     dijkstra_all(g, first, tmp_dist);
     for (int v = 0; v < n; v++)
         if (tmp_dist[v] < min_dist[v]) min_dist[v] = tmp_dist[v];
 
-    /* Landmarks suivants */
+    /* Landmarks suivants : argmax de min_dist, restreint à la grande composante */
     for (int i = 1; i < K; i++) {
         int    best_v   = -1;
         double best_val = -1.0;
-        for (int v = 0; v < n; v++) {
-            /* On ignore les nœuds inaccessibles depuis tous les landmarks
-             * déjà choisis (min_dist == DBL_MAX), sinon on prendrait
-             * systématiquement un nœud isolé. */
+        for (int j = 0; j < main_size; j++) {
+            int v = main_nodes[j];
             if (min_dist[v] == DBL_MAX) continue;
             if (min_dist[v] > best_val) {
                 best_val = min_dist[v];
@@ -787,8 +827,8 @@ static void select_landmarks_farthest(const CSRGraph *g, int K,
         if (best_v < 0) {
             fprintf(stderr,
                 "  [warn] sélection farthest : impossible de placer le "
-                "landmark %d (pas assez de nœuds connexes)\n", i);
-            best_v = rand() % n;
+                "landmark %d\n", i);
+            best_v = main_nodes[rand() % main_size];
         }
         landmarks[i] = best_v;
 
@@ -797,8 +837,8 @@ static void select_landmarks_farthest(const CSRGraph *g, int K,
             if (tmp_dist[v] < min_dist[v]) min_dist[v] = tmp_dist[v];
     }
 
-    free(min_dist);
-    free(tmp_dist);
+    free(min_dist); free(tmp_dist);
+    free(main_nodes); free(in_main);
 }
 
 
@@ -840,6 +880,7 @@ static ALTData *alt_preprocess(const CSRGraph *g, const CSRGraph *g_rev,
         alt->dist_to[i] = malloc(n * sizeof(double));
         dijkstra_all(g_rev, alt->landmarks[i], alt->dist_to[i]);
     }
+
 
     double t1 = now_ms();
     alt->prep_time_ms = t1 - t0;
