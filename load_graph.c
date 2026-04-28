@@ -2135,20 +2135,20 @@ static TimeStats compute_stats(double *times_ms, int n) {
 /* ─── 16.4 Classification des requêtes par distance ────────────────────── */
 /*
  * On classe les requêtes en 3 catégories selon la distance Dijkstra :
- *   SHORT  : distance < 5 km
- *   MEDIUM : entre 5 km et 30 km
- *   LONG   : > 30 km
+ *   SHORT  : distance < 20 km   (intra-ville/agglo)
+ *   MEDIUM : 20 - 80 km          (inter-villes courtes)
+ *   LONG   : > 80 km             (régional)
  *
- * Ces seuils sont raisonnables pour un graphe routier régional.
- * À adapter pour une ville (mettre ex. 1 km / 5 km) ou un pays
- * (ex. 50 km / 200 km).
+ * Ces seuils sont calibrés pour un graphe régional comme la
+ * Champagne-Ardenne (≈ 200 km de diagonale). À adapter pour une
+ * autre échelle : ville (ex. 1 / 5 km), pays (ex. 50 / 200 km).
  */
 typedef enum { CAT_SHORT = 0, CAT_MEDIUM = 1, CAT_LONG = 2, CAT_N = 3 } Category;
 static const char *CAT_NAMES[CAT_N] = {"SHORT", "MEDIUM", "LONG"};
 
 static Category classify_distance(double dist_m) {
-    if (dist_m < 5000.0)  return CAT_SHORT;
-    if (dist_m < 30000.0) return CAT_MEDIUM;
+    if (dist_m < 20000.0) return CAT_SHORT;
+    if (dist_m < 80000.0) return CAT_MEDIUM;
     return CAT_LONG;
 }
 
@@ -2364,7 +2364,7 @@ cleanup_q:
      * STATS PAR CATÉGORIE (SHORT / MEDIUM / LONG)
      * ───────────────────────────────────────────────────────────────── */
     printf("\n=== Stats par catégorie de distance ===\n");
-    printf("  Seuils : SHORT < 5km , MEDIUM 5-30km , LONG > 30km\n");
+    printf("  Seuils : SHORT < 20km , MEDIUM 20-80km , LONG > 80km\n");
     printf("  Effectifs : SHORT=%d  MEDIUM=%d  LONG=%d\n",
            cat_count[CAT_SHORT], cat_count[CAT_MEDIUM], cat_count[CAT_LONG]);
 
