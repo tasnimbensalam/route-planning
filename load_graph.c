@@ -1,65 +1,27 @@
-/*
- * route_planning.c
- * Étapes 2, 3 et 4 — CSR + Dijkstra + A*
- *
- * Compilation : gcc -O2 -o route_planning route_planning.c -lm
- * Usage       : ./route_planning nodes.csv edges.csv
- *
- * Ce fichier contient tout en un seul endroit :
- *   - Chargement des CSV et construction du graphe CSR  (étape 2)
- *   - Algorithme de Dijkstra avec min-heap              (étape 3)
- *   - Algorithme A* avec heuristique Haversine          (étape 4)
- *   - Benchmark automatique sur 10 paires aléatoires
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
-#include <time.h>    /* pour mesurer le temps d'exécution */
-#include <float.h>   /* pour DBL_MAX (infini initial des distances) */
+#include <time.h>
+#include <float.h>
 #ifndef M_PI
     #define M_PI 3.14159265358979323846
 #endif
 
-/* ─── Chrono haute précision (nanoseconde) ─────────────────────────────
- * clock() est trop grossier (10 ms sous Linux). On utilise CLOCK_MONOTONIC
- * pour mesurer les requêtes courtes (< 1 ms) sans les voir comme "0".
- */
 static inline double now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * SECTION 1 — STRUCTURES DE DONNÉES
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/*
- * Node : informations géographiques d'un nœud après renumérotation.
- * On stocke la latitude et longitude pour pouvoir calculer
- * l'heuristique Haversine dans A*.
- */
 typedef struct {
     long long osm_id;   /* identifiant OSM original (grand entier) */
     double    lat;      /* latitude  en degrés décimaux            */
     double    lon;      /* longitude en degrés décimaux            */
 } Node;
 
-/*
- * CSRGraph : le graphe stocké en format Compressed Sparse Row.
- *
- * Rappel de la structure (voir README) :
- *   Pour lister les voisins du nœud i, on fait :
- *       for (k = row_ptr[i]; k < row_ptr[i+1]; k++)
- *           voisin = adj[k], poids = weights[k]
- *
- *   row_ptr a une taille de n_nodes + 1.
- *   adj et weights ont une taille de n_edges.
- */
+/* CSRGraph : le graphe stocké en format Compressed Sparse Row */
 typedef struct {
     int     n_nodes;
     int     n_edges;
@@ -104,15 +66,7 @@ typedef struct {
 } ShortestPathResult;
 
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * SECTION 2 — TABLE DE HACHAGE (pour renuméroter les IDs OSM)
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * Les IDs OSM sont de grands entiers (ex: 3703570445).
- * On ne peut pas les utiliser directement comme indices de tableau.
- * On crée donc une table de hachage qui fait la correspondance :
- *   osm_id (long long) → indice local (int, 0..N-1)
- */
+/* Table de hashage*/
 
 #define HASH_EMPTY  (-1LL)
 
@@ -165,11 +119,6 @@ static int map_get(HashMap *m, long long key) {
 }
 
 static void map_free(HashMap *m) { free(m->table); free(m); }
-
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * SECTION 3 — LECTURE DES CSV ET CONSTRUCTION CSR
- * ═══════════════════════════════════════════════════════════════════════════ */
 
 static Node *read_nodes(const char *path, int *out_n, HashMap **out_map) {
     FILE *f = fopen(path, "r");
@@ -232,21 +181,6 @@ static RawEdge *read_edges(const char *path, HashMap *map, int *out_m) {
     return edges;
 }
 
-/*
- * build_csr : construit la structure CSR en 3 passes.
- *
- * Passe 1 — On compte combien d'arêtes partent de chaque nœud.
- *   row_ptr[u+1]++ pour chaque arête (u→v).
- *   Après la passe 1, row_ptr[i+1] contient le degré sortant de i.
- *
- * Passe 2 — Somme préfixe (prefix sum).
- *   row_ptr[i] = row_ptr[0] + row_ptr[1] + ... + row_ptr[i-1]
- *   Maintenant row_ptr[i] est l'indice de début des arêtes de i dans adj[].
- *
- * Passe 3 — On remplit adj[] et weights[].
- *   On utilise un tableau "cursor" (copie de row_ptr) comme compteur
- *   qui avance au fur et à mesure qu'on place les arêtes.
- */
 static CSRGraph *build_csr(int n, RawEdge *edges, int m) {
     CSRGraph *g = malloc(sizeof(CSRGraph));
     g->n_nodes = n; g->n_edges = m;
@@ -274,30 +208,7 @@ static void csr_free(CSRGraph *g) {
 }
 
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * SECTION 4 — MIN-HEAP (FILE DE PRIORITÉ)
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * Un tas binaire min est un arbre binaire complet stocké dans un tableau.
- * La propriété fondamentale : chaque nœud a une clé <= celles de ses enfants.
- * Donc le minimum est TOUJOURS à l'indice 0.
- *
- * Deux opérations principales :
- *   heap_push : ajoute un élément → le place à la fin, puis "remonte"
- *   heap_pop  : retire le minimum → remplace la racine par le dernier
- *               élément, puis "descend" pour restaurer la propriété du tas
- *
- * Exemple de tas avec les valeurs [1, 3, 2, 7, 5, 4] :
- *         1          ← indice 0 (minimum, toujours en haut)
- *        / \
- *       3   2        ← indices 1, 2
- *      / \ / \
- *     7  5 4         ← indices 3, 4, 5
- *
- * Relations dans le tableau : parent(i) = (i-1)/2
- *                              enfant_gauche(i) = 2*i + 1
- *                              enfant_droit(i)  = 2*i + 2
- */
+/* MIN-HEAP */
 
 static MinHeap *heap_create(int initial_cap) {
     MinHeap *h = malloc(sizeof(MinHeap));
@@ -366,22 +277,6 @@ static HeapNode heap_pop(MinHeap *h) {
     return result;
 }
 
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * SECTION 5 — HEURISTIQUE HAVERSINE (pour A*)
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * Calcule la distance à vol d'oiseau entre deux points GPS.
- * C'est la distance réelle en ligne droite sur la Terre (sphère).
- *
- * Cette distance est TOUJOURS <= distance réelle sur route.
- * C'est ce qu'on appelle une heuristique "admissible" pour A* :
- * elle ne surestime jamais le coût réel, donc A* reste correct.
- *
- * Si on divisait par la vitesse max du réseau, on obtiendrait
- * une heuristique en secondes (pour un critère temps plutôt que distance).
- * On reste ici en mètres pour la cohérence avec les poids du graphe.
- */
 static double haversine(double lat1, double lon1, double lat2, double lon2) {
     const double R = 6371000.0;  /* rayon moyen de la Terre en mètres */
     double phi1 = lat1 * M_PI / 180.0;
@@ -393,48 +288,9 @@ static double haversine(double lat1, double lon1, double lat2, double lon2) {
     return 2.0 * R * asin(sqrt(a));
 }
 
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * SECTION 6 — DIJKSTRA
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * Dijkstra trouve le plus court chemin depuis 'source' vers 'target'.
- *
- * IDÉE GÉNÉRALE :
- *   On maintient pour chaque nœud v une "distance courante" dist[v].
- *   Au départ : dist[source] = 0, dist[tous les autres] = +infini.
- *   On utilise un tas min pour toujours traiter en premier
- *   le nœud non-traité avec la plus petite distance connue.
- *
- * INVARIANT DE L'ALGORITHME :
- *   Quand on extrait un nœud u du tas, dist[u] est définitivement optimal.
- *   (C'est pourquoi Dijkstra ne fonctionne qu'avec des poids positifs !)
- *
- * DÉROULEMENT ÉTAPE PAR ÉTAPE :
- *   1. Initialiser dist[source] = 0, tout le reste = DBL_MAX
- *   2. Pousser (source, 0) dans le tas
- *   3. Tant que le tas n'est pas vide :
- *      a. Extraire u = nœud avec la plus petite distance dans le tas
- *      b. Si dist extrait > dist[u], ce nœud est "périmé" → ignorer (*)
- *      c. Si u == target → on a trouvé le plus court chemin, arrêter
- *      d. Pour chaque voisin v de u :
- *         - Calculer new_dist = dist[u] + poids(u,v)
- *         - Si new_dist < dist[v] : mettre à jour dist[v], pousser (v, new_dist)
- *
- * (*) Note sur les "entrées périmées" :
- *   On utilise un tas "paresseux" : au lieu de modifier une entrée existante
- *   dans le tas (opération coûteuse), on ajoute simplement une nouvelle entrée
- *   avec la distance mise à jour. Les anciennes entrées restent dans le tas
- *   mais seront ignorées grâce au test "if (f > dist[u]) continue".
- *
- * RECONSTRUCTION DU CHEMIN :
- *   On maintient un tableau prev[v] = nœud depuis lequel on a atteint v
- *   avec la meilleure distance. À la fin, on remonte de target à source.
- */
 static ShortestPathResult dijkstra(const CSRGraph *g, int source, int target) {
     ShortestPathResult res = {-1.0, NULL, 0, 0, 0, 0.0};
     double t0 = now_ms();
-    
 
     int n = g->n_nodes;
 
@@ -500,38 +356,7 @@ static ShortestPathResult dijkstra(const CSRGraph *g, int source, int target) {
 }
 
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * SECTION 7 — A* (A-ÉTOILE)
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * A* est une amélioration de Dijkstra qui utilise une heuristique h(v)
- * pour "guider" la recherche vers la cible.
- *
- * DIFFÉRENCE AVEC DIJKSTRA :
- *   Dijkstra trie les nœuds par dist[v]           (coût depuis source)
- *   A*       trie les nœuds par dist[v] + h(v,t)  (coût estimé total)
- *                                         ↑ heuristique = estimation du reste
- *
- * INTUITION :
- *   Dijkstra explore dans un cercle autour de la source (tous les nœuds
- *   à distance d, puis tous les nœuds à distance d+ε, etc.).
- *   A* explore dans une ellipse orientée vers la cible : il "sait"
- *   approximativement où aller et évite d'explorer dans la mauvaise direction.
- *
- * POURQUOI H(V) = HAVERSINE EST CORRECT ?
- *   Pour que A* trouve bien le plus court chemin, h doit être "admissible" :
- *       h(v, t) <= vraie distance(v, t)    pour tout v
- *   La distance à vol d'oiseau est toujours <= distance réelle sur route.
- *   Donc Haversine est admissible. ✓
- *
- * LE CODE EST QUASI-IDENTIQUE À DIJKSTRA, avec une seule différence :
- *   La clé du tas f = dist[v] + h(v, target) au lieu de dist[v].
- *
- * NOTATION CLASSIQUE EN INFORMATIQUE :
- *   g(v) = dist[v]         = coût réel depuis la source
- *   h(v) = haversine(v, t) = estimation du coût restant
- *   f(v) = g(v) + h(v)     = estimation du coût total du chemin passant par v
- */
+/* A* */
 static ShortestPathResult astar(const CSRGraph *g,
                                  const Node *nodes,
                                  int source, int target) {
@@ -602,39 +427,7 @@ static ShortestPathResult astar(const CSRGraph *g,
     return res;
 }
 
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * SECTION 8 — (libre — l'ancien print_result et verify_same_dist ont été
- * remplacés par les utilitaires du benchmark, voir section 16)
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * SECTION 9 — DIJKSTRA "ALL-NODES" + GRAPHE INVERSE
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * Pour ALT et CH, on a besoin de deux choses qu'on n'avait pas :
- *
- *   1) Un Dijkstra qui calcule les distances depuis une source vers TOUS
- *      les nœuds atteignables (pas d'arrêt anticipé sur une cible).
- *      → c'est ce qu'on utilise pour pré-calculer les distances aux
- *        landmarks (ALT) et pour la recherche de témoins (CH).
- *
- *   2) Le graphe inverse G' : si (u → v) est dans G, alors (v → u) est
- *      dans G'. Indispensable pour :
- *        - calculer d(v, ℓ) (distance VERS un landmark) en faisant un
- *          Dijkstra depuis ℓ sur G',
- *        - faire la recherche en arrière dans le bidirectionnel CH.
- */
-
-/* ─── 9.1 Dijkstra qui remplit le tableau dist[] depuis source ────────── */
-/*
- * Variante "pas d'arrêt" du Dijkstra de la section 6.
- * À la sortie : dist[v] = plus court chemin source → v (ou DBL_MAX si v
- * inaccessible). Aucun chemin n'est reconstruit ici.
- *
- * Complexité : O((N + M) log N).
- */
+/*  DIJKSTRA "ALL-NODES" + GRAPHE INVERSE */
 static void dijkstra_all(const CSRGraph *g, int source, double *dist) {
     int n = g->n_nodes;
     for (int i = 0; i < n; i++) dist[i] = DBL_MAX;
@@ -662,12 +455,10 @@ static void dijkstra_all(const CSRGraph *g, int source, double *dist) {
 }
 
 
-/* ─── 9.2 Construction du graphe inverse ──────────────────────────────── */
-/*
- * À partir d'un graphe CSR direct, on construit son graphe inverse.
- * L'astuce : on part d'une liste de RawEdge inversées (v, u, w),
- * puis on appelle build_csr() qui sait déjà construire un CSR.
- */
+/* Construction du graphe inverse 
+* À partir d'un graphe CSR direct, on construit son graphe inverse.
+*/
+
 static CSRGraph *build_reverse_csr(const CSRGraph *g) {
     int n = g->n_nodes;
     int m = g->n_edges;
@@ -676,7 +467,7 @@ static CSRGraph *build_reverse_csr(const CSRGraph *g) {
     int idx = 0;
     for (int u = 0; u < n; u++) {
         for (int k = g->row_ptr[u]; k < g->row_ptr[u + 1]; k++) {
-            rev[idx].u = g->adj[k];   /* l'arc inverse part de v */
+            rev[idx].u = g->adj[k];
             rev[idx].v = u;
             rev[idx].w = g->weights[k];
             idx++;
@@ -688,50 +479,7 @@ static CSRGraph *build_reverse_csr(const CSRGraph *g) {
 }
 
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * SECTION 10 — ALT : A* AVEC LANDMARKS (PRÉTRAITEMENT)
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * IDÉE
- *   A* avec Haversine est limité : la distance à vol d'oiseau sous-estime
- *   très fortement le vrai coût routier (autoroutes obliques, montagnes,
- *   contournements...). Du coup l'heuristique reste faible et A* explore
- *   encore beaucoup de nœuds inutiles.
- *
- *   ALT utilise un PRÉ-CALCUL de distances exactes vers/depuis quelques
- *   nœuds repères (landmarks), et combine ça avec l'inégalité triangulaire :
- *
- *       d(v, t)  ≥  d(ℓ, t)  − d(ℓ, v)        (forward, depuis landmark)
- *       d(v, t)  ≥  d(v, ℓ)  − d(t, ℓ)        (backward, vers landmark)
- *
- *   On prend le max sur tous les landmarks ℓ et sur les deux variantes :
- *
- *       h_ALT(v, t) = max_ℓ max( d(ℓ, t)−d(ℓ, v),
- *                                 d(v, ℓ)−d(t, ℓ),
- *                                 0 )
- *
- *   Cette heuristique reste ADMISSIBLE (le max d'admissibles l'est).
- *   Et comme elle est plus serrée que la haversine, A* explore moins.
- *
- *   Note : le sujet ne donne que la version "forward". On ajoute la
- *   "backward" car le graphe routier est dirigé (sens uniques) : la
- *   version bidirectionnelle est nettement plus informative.
- *
- * COÛTS
- *   - Prétraitement : 2K Dijkstra "all-nodes" (K = nombre de landmarks),
- *     soit O(K · (N + M) log N).
- *   - Mémoire       : 2K · N · 8 octets.
- *   - Requête       : un A* normal mais avec h_ALT au lieu de Haversine.
- *
- * SÉLECTION DES LANDMARKS — STRATÉGIE "FARTHEST"
- *   Choisir K landmarks de façon à les disperser au maximum :
- *     ℓ_0 : un nœud aléatoire
- *     ℓ_i : le nœud le plus éloigné des landmarks déjà choisis
- *           (au sens : max sur les v du min sur les ℓ_j déjà pris de d(ℓ_j, v))
- *
- *   Bien meilleur qu'un tirage aléatoire, presque aussi bon que
- *   les méthodes plus sophistiquées (avoid, planar...) selon la littérature.
- */
+/* ALT : A* AVEC LANDMARKS (PRÉTRAITEMENTS) */
 
 typedef struct {
     int       num_landmarks;
@@ -742,32 +490,10 @@ typedef struct {
     size_t    memory_bytes;  /* mémoire utilisée (estimation)                 */
 } ALTData;
 
-
-/*
- * Sélection "farthest" des landmarks, RESTREINTE à la plus grande
- * composante connexe accessible.
- *
- * Pourquoi cette restriction ?
- *   Un graphe routier OSM contient souvent de petites composantes
- *   isolées (parkings privés, enclaves mal connectées, erreurs de
- *   tagging). Si on tire le premier landmark dans une de ces micro-
- *   composantes (ex. 10 nœuds), il ne peut atteindre que ces 10 nœuds
- *   et l'heuristique ALT vaut 0 partout ailleurs → ALT ≡ Dijkstra.
- *
- * Algorithme :
- *   1. BFS depuis un nœud "central" (on prend celui de plus haut degré
- *      sortant comme heuristique simple — il est probablement dans la
- *      grande composante). On marque tous les nœuds atteints.
- *   2. On ne pioche les landmarks que parmi les nœuds atteints.
- */
 static void select_landmarks_farthest(const CSRGraph *g, int K,
                                       int *landmarks, unsigned seed) {
     int n = g->n_nodes;
 
-    /* ── Étape 1 : trouver la plus grande composante (par BFS) ── */
-    /* Heuristique : on part du nœud de plus haut degré sortant. Sur un
-     * graphe routier réel, ce nœud est forcément dans la grande
-     * composante (carrefour important). */
     int seed_node = 0, max_deg = -1;
     for (int v = 0; v < n; v++) {
         int d = g->row_ptr[v + 1] - g->row_ptr[v];
@@ -841,13 +567,6 @@ static void select_landmarks_farthest(const CSRGraph *g, int K,
     free(main_nodes); free(in_main);
 }
 
-
-/*
- * Prétraitement complet ALT :
- *   - sélectionne K landmarks (farthest)
- *   - calcule dist_from[i][v] = d(ℓ_i, v) (Dijkstra sur le graphe direct)
- *   - calcule dist_to[i][v]   = d(v, ℓ_i) (Dijkstra sur le graphe inverse)
- */
 static ALTData *alt_preprocess(const CSRGraph *g, const CSRGraph *g_rev,
                                 int K, unsigned seed) {
     double t0 = now_ms();
@@ -900,15 +619,6 @@ static void alt_free(ALTData *alt) {
     free(alt);
 }
 
-
-/* ─── Heuristique ALT, à plat et inlinable ───────────────────────────────
- * Pour une requête (s, t) figée, on précalcule un tableau de constantes
- *   C_fwd[i] = dist_from[i][t]
- *   C_bwd[i] = dist_to[i][t]
- * Du coup, l'évaluation de h(v) ne fait qu'un parcours linéaire des K
- * landmarks, sans rappeler aucune fonction lourde. C'est important :
- * h(v) est appelé une fois par relaxation, donc des millions de fois.
- */
 static inline double alt_h(const ALTData *alt, int v,
                             const double *C_fwd, const double *C_bwd) {
     double best = 0.0;
@@ -932,18 +642,7 @@ static inline double alt_h(const ALTData *alt, int v,
 }
 
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * SECTION 11 — ALT : LA REQUÊTE
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * Code identique à A* (section 7), avec deux différences :
- *   - On précalcule C_fwd[i] = d(ℓ_i, t) et C_bwd[i] = d(t, ℓ_i)
- *     (constantes pour toute la requête).
- *   - On remplace haversine() par alt_h(v, C_fwd, C_bwd).
- *
- * Le reste — file de priorité, vérification d'entrée périmée, relaxation,
- * reconstruction de chemin — est strictement le même.
- */
+/*  ALT : LA REQUÊTE */
 static ShortestPathResult alt_query(const CSRGraph *g,
                                      const ALTData *alt,
                                      int source, int target) {
@@ -974,7 +673,7 @@ static ShortestPathResult alt_query(const CSRGraph *g,
         HeapNode cur = heap_pop(heap);
         int    u = cur.node;
         double h_u = alt_h(alt, u, C_fwd, C_bwd);
-        if (cur.f_score > g_score[u] + h_u) continue;  /* périmé */
+        if (cur.f_score > g_score[u] + h_u) continue;
 
         res.nodes_explored++;
         if (u == target) break;
@@ -1012,47 +711,7 @@ static ShortestPathResult alt_query(const CSRGraph *g,
 }
 
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * SECTION 12 — CONTRACTION HIERARCHIES (CH) : STRUCTURES DE DONNÉES
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * VUE D'ENSEMBLE
- *   CH est une approche très différente de Dijkstra / A* / ALT.
- *   On accepte de payer cher en prétraitement pour obtenir des requêtes
- *   ultra-rapides. Idéal quand on doit répondre à BEAUCOUP de requêtes.
- *
- *   Le prétraitement CH se déroule ainsi :
- *     1. On choisit un ordre de contraction sur les nœuds (du moins
- *        important au plus important).
- *     2. On contracte les nœuds un par un, dans cet ordre. "Contracter"
- *        un nœud v signifie : pour chaque paire (u, w) telle que u→v→w,
- *        on regarde si ce passage par v est un plus court chemin unique.
- *        Si oui, on ajoute un RACCOURCI u→w (weight = w(u,v)+w(v,w)).
- *     3. Le graphe final = arêtes originales + raccourcis.
- *
- *   À la requête, on fait un Dijkstra BIDIRECTIONNEL "qui ne descend
- *   jamais" : on ne suit que les arêtes qui montent dans la hiérarchie
- *   (level[u] < level[v]).
- *
- * STRUCTURES DYNAMIQUES
- *   Pendant le prétraitement, on ajoute des arêtes au fur et à mesure :
- *   le CSR (statique) ne convient plus. On utilise donc des listes
- *   d'adjacence dynamiques (un tableau par nœud, qui grandit avec realloc).
- *   À la fin de la phase de contraction, on REPLIE tout en CSR pour la
- *   phase requête (qui exige de la rapidité maximale).
- *
- *   Chaque arête CH stocke :
- *     - to     : nœud cible
- *     - w      : poids
- *     - via    : -1 si arête originale, sinon indice du nœud "milieu"
- *                contracté qui a généré ce raccourci. C'est ce qui permet
- *                la reconstruction du vrai chemin (unpacking).
- *
- * REMARQUE : on stocke aussi les arêtes ENTRANTES (in[v]). C'est nécessaire
- * pour, lors de la contraction de v, énumérer les paires (u, v) → (v, w)
- * sans devoir parcourir tout le graphe. C'est une duplication mémoire,
- * mais limitée à la phase de prétraitement (libérée ensuite).
- */
+/* CONTRACTION HIERARCHIES (CH) */
 
 typedef struct {
     int    to;
@@ -1175,19 +834,6 @@ static int ch_add_or_update(CHGraph *ch, int u, int to, double w, int via) {
     return 1;
 }
 
-
-/* ───────────────────────────────────────────────────────────────────────
- * Buffer global réutilisable pour la recherche de témoins.
- * On utilise l'astuce des "epochs" pour éviter de réinitialiser un
- * tableau de taille N à chaque mini-Dijkstra.
- *
- *   dist_epoch[v] == cur_epoch  →  dist_value[v] est valide
- *   sinon                        →  dist_value[v] est considéré comme +∞
- *
- * On incrémente cur_epoch entre deux recherches : tous les anciens
- * marquages deviennent automatiquement "périmés" sans avoir besoin de
- * boucle de reset.
- * ─────────────────────────────────────────────────────────────────────── */
 typedef struct {
     int       n;
     double   *value;
@@ -1223,64 +869,12 @@ static inline void witness_set(WitnessBuf *wb, int v, double d) {
 }
 
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * SECTION 13 — CH : RECHERCHE DE TÉMOINS, CONTRACTION, ORDRE
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * 13.1 RECHERCHE DE TÉMOINS
- *   Pour décider si u→v→w doit donner un raccourci :
- *     - On calcule dCH = w(u,v) + w(v,w).
- *     - On cherche s'il existe un autre chemin de u à w, n'utilisant ni v
- *       ni les nœuds déjà contractés, de longueur ≤ dCH.
- *     - Si oui (TÉMOIN trouvé) : pas de raccourci.
- *     - Sinon : on doit ajouter le raccourci u→w avec poids dCH.
- *
- *   Contrainte d'efficacité : on LIMITE la recherche
- *     - en distance (on ne dépasse pas dCH),
- *     - en nombre de "hops" (on ne va pas trop loin en nombre d'arêtes).
- *   Si la recherche se termine sans avoir prouvé l'existence d'un témoin,
- *   on est conservateur et on ajoute le raccourci. Cela peut produire
- *   QUELQUES raccourcis superflus, mais la correction n'est pas affectée.
- *
- * 13.2 OPTIMISATION — DIJKSTRA "ONE-TO-MANY" PAR SOURCE
- *   Quand on contracte v, pour un même prédécesseur u (in-neighbor),
- *   il peut exister plusieurs successeurs w. Plutôt que de relancer une
- *   recherche par cible, on fait UNE SEULE recherche depuis u, et on lit
- *   ensuite dist[w] pour chaque w. Gain net.
- *
- * 13.3 EDGE DIFFERENCE
- *   Pour décider QUEL nœud contracter en premier, on calcule, pour chaque
- *   candidat v, le nombre de raccourcis qui SERAIENT ajoutés s'il était
- *   contracté maintenant. La priorité (clé du tas) est :
- *
- *      ED(v) = (#raccourcis simulés) − (in_degree(v) + out_degree(v))
- *
- *   Plus c'est petit (voire négatif), plus on préfère contracter v tôt.
- *   On utilise un tas avec mises à jour PARESSEUSES : quand on extrait v,
- *   on recalcule sa priorité ; si ce n'est plus le minimum, on le repousse
- *   et on continue.
- */
+/* CH : RECHERCHE DE TÉMOINS, CONTRACTION, ORDRE */
 
 /* Limites de la recherche de témoins (à régler selon le graphe) */
 #define WITNESS_HOP_LIMIT     5      /* nombre max d'arêtes du témoin */
 #define WITNESS_NODE_LIMIT  500      /* nombre max de pop avant abandon */
 
-
-/*
- * Dijkstra borné depuis u, sur le graphe non-contracté, en évitant le
- * nœud forbidden (= v en cours de contraction).
- *   - max_dist     : on ne pousse jamais une distance > max_dist.
- *   - hop_limit    : on s'arrête de relâcher à partir de hop_limit hops.
- *   - node_limit   : on extrait au plus node_limit nœuds.
- *
- * À la sortie, witness_get(wb, w) renvoie soit la distance trouvée pour w,
- * soit DBL_MAX si on ne l'a pas atteint dans la limite.
- *
- * Note : on ne suit que les arêtes vers des nœuds NON contractés. Sinon,
- * un témoin pourrait passer par un raccourci... ce qui est en fait une
- * bonne chose ! Donc on autorise les nœuds non-contractés y compris ceux
- * qu'on contractera plus tard, mais pas ceux DÉJÀ contractés (hors hierarchie).
- */
 static void witness_search(const CHGraph *ch, WitnessBuf *wb,
                             int u, int forbidden,
                             double max_dist, int hop_limit) {
@@ -1323,15 +917,6 @@ static void witness_search(const CHGraph *ch, WitnessBuf *wb,
  * shortcuts[] de capacité cap. Le nombre de raccourcis produit est
  * renvoyé via *out_count. Si le tableau est NULL, on se contente de
  * compter (mode "simulation" pour calculer ED).
- *
- * Algorithme :
- *   pour chaque u ∈ in_neighbors(v), non contracté :
- *     pour chaque w ∈ out_neighbors(v), non contracté, w ≠ u :
- *       dCH = w(u,v) + w(v,w)
- *     max_dCH = max sur tous les w
- *     witness_search(u, forbidden=v, max_dist=max_dCH)
- *     pour chaque w :
- *       si witness_get(w) > w(u,v) + w(v,w) : raccourci nécessaire
  */
 typedef struct { int u, w; double weight; } CHShortcut;
 
@@ -1419,38 +1004,8 @@ static void ch_contract_node(CHGraph *ch, WitnessBuf *wb, int v) {
 }
 
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * SECTION 14 — CH : BOUCLE DE CONTRACTION + PLIAGE EN CSR
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * 14.1 BOUCLE PRINCIPALE
- *   On gère l'ordre de contraction avec une file de priorité (tas min)
- *   sur l'edge difference. Mises à jour PARESSEUSES :
- *     - Quand on extrait v du tas, on recalcule ED(v).
- *     - Si ED(v) > priorité minimale courante du tas → v n'est plus le
- *       meilleur candidat, on le repousse avec sa nouvelle priorité.
- *     - Sinon → on le contracte.
- *     - Après contraction, on repousse les voisins actifs avec une
- *       nouvelle ED (les anciennes entrées resteront dans le tas, mais
- *       seront détectées comme périmées à leur tour).
- *
- * 14.2 PLIAGE EN CSR
- *   Une fois la contraction terminée, on recopie tout le graphe
- *   augmenté (arêtes originales + raccourcis) dans une structure CSR
- *   "lourde" qui inclut un champ via[] supplémentaire.
- *   On construit aussi son inverse pour la recherche en arrière.
- *
- *   Lors de la requête, on filtre dynamiquement les arêtes selon la
- *   condition CH : on ne suit que les arêtes (u→v) avec level[u]<level[v].
- *   C'est un test "if" par arête en plus, mais ça évite de gérer deux
- *   CSR séparés (up et down).
- */
+/* CH : BOUCLE DE CONTRACTION + PLIAGE EN CSR */
 
-/*
- * CSRGraphCH : variante du CSR qui ajoute un champ via par arête.
- * via[k] = -1 si l'arête est originale, sinon indice du nœud milieu
- * contracté qui a généré ce raccourci. Indispensable pour l'unpacking.
- */
 typedef struct {
     int     n_nodes;
     int     n_edges;
@@ -1463,7 +1018,6 @@ typedef struct {
 static void csr_ch_free(CSRGraphCH *g) {
     free(g->row_ptr); free(g->adj); free(g->weights); free(g->via); free(g);
 }
-
 
 /*
  * CHIndex : tout ce dont la requête CH a besoin.
@@ -1506,7 +1060,7 @@ static void ch_contract_all(CHGraph *ch, WitnessBuf *wb, int verbose) {
     while (pq->size > 0) {
         HeapNode top = heap_pop(pq);
         int v = top.node;
-        if (ch->contracted[v]) continue;       /* entrée périmée */
+        if (ch->contracted[v]) continue;
 
         /* Recalcul de la priorité */
         int ed_now = ch_edge_difference(ch, wb, v);
@@ -1679,38 +1233,7 @@ static void ch_index_free(CHIndex *idx) {
 }
 
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * SECTION 15 — CH : REQUÊTE BIDIRECTIONNELLE ET UNPACKING
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * 15.1 RECHERCHE BIDIRECTIONNELLE
- *   On lance DEUX Dijkstras en parallèle :
- *     - "forward"  depuis source, sur idx->up,     sens normal,
- *     - "backward" depuis target, sur idx->up_rev, sens normal aussi.
- *   DANS LES DEUX, on ne suit que les arêtes qui montent dans la
- *   hiérarchie : level[destination] > level[origine].
- *
- *   À chaque itération, on pop le nœud de plus faible f_score parmi les
- *   deux tas. On entretient une variable best_meet = min sur les nœuds
- *   visités v de (dist_fwd[v] + dist_bwd[v]).
- *
- *   ARRÊT : on s'arrête dès que la plus petite clé restante (parmi les
- *   deux tas) est ≥ best_meet. À ce moment, plus aucune amélioration
- *   n'est possible.
- *
- * 15.2 UNPACKING
- *   Une fois la distance et le nœud de jonction m connus, on reconstruit
- *   le chemin réel :
- *     - forward part  : m → ... → s (en remontant prev_fwd), inversée.
- *     - backward part : m → ... → t (en suivant prev_bwd directement).
- *   On obtient une suite d'arêtes (a → b) du graphe AUGMENTÉ, qui peuvent
- *   être :
- *     - originales (via = -1) → on les émet telles quelles,
- *     - des raccourcis (via = mid) → on remplace récursivement par
- *       (a → mid) puis (mid → b).
- *
- *   Les sous-arêtes sont retrouvées par scan dans idx->up.
- */
+/* CH : REQUÊTE BIDIRECTIONNELLE ET UNPACKING */
 
 
 /* Cherche dans le CSR direct l'arête (u → v) de poids minimum.
@@ -1794,8 +1317,8 @@ static ShortestPathResult ch_query(const CHIndex *idx, int source, int target) {
     double *db = malloc(n * sizeof(double));
     int    *pf = malloc(n * sizeof(int));
     int    *pb = malloc(n * sizeof(int));
-    int    *vf = malloc(n * sizeof(int));   /* via de l'arête prev_fwd[v] → v */
-    int    *vb = malloc(n * sizeof(int));   /* via de l'arête v → prev_bwd[v] */
+    int    *vf = malloc(n * sizeof(int));
+    int    *vb = malloc(n * sizeof(int));
     for (int i = 0; i < n; i++) {
         df[i] = DBL_MAX; db[i] = DBL_MAX;
         pf[i] = -1;      pb[i] = -1;
@@ -1884,7 +1407,7 @@ static ShortestPathResult ch_query(const CHIndex *idx, int source, int target) {
 
     res.dist = best_meet;
 
-    /* ─── Reconstruction du chemin avec unpacking ─── */
+    /* Reconstruction du chemin avec unpacking */
 
     /* Étape 1 : récupérer la séquence d'arêtes (a→b avec via) du chemin. */
     /*   forward part : meet → source en remontant pf, à inverser
@@ -1954,24 +1477,6 @@ static ShortestPathResult ch_query(const CHIndex *idx, int source, int target) {
     return res;
 }
 
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * SECTION 16 — UTILITAIRES POUR LE BENCHMARK
- * ═══════════════════════════════════════════════════════════════════════════
- *
- * Ce qu'on met ici (en plus du main) :
- *   - parsing de la ligne de commande (--landmarks, --queries, --csv, --seed)
- *   - validation d'un chemin reconstruit (vérifie que la séquence est un
- *     vrai chemin du graphe et que la somme des poids matche la distance)
- *   - calcul de statistiques sur des temps : moyenne, p50, p95
- *   - classification des requêtes en SHORT / MEDIUM / LONG selon la distance
- *     Dijkstra (référence) — réponse à la question "le gain est-il stable ?"
- *   - export CSV des résultats détaillés (1 ligne par requête × algo)
- */
-
-
-/* ─── 16.1 Configuration de la ligne de commande ───────────────────────── */
-
 typedef struct {
     const char *nodes_path;
     const char *edges_path;
@@ -2034,19 +1539,8 @@ static Config parse_args(int argc, char *argv[]) {
 }
 
 
-/* ─── 16.2 Validation d'un chemin reconstruit ──────────────────────────── */
-/*
- * Vérifie que (path[0], path[1], ..., path[len-1]) est un vrai chemin
- * dans le graphe G, et que la somme des poids sur ce chemin est
- * (à tolérance près) égale à expected_dist.
- *
- * Ce check est essentiel pour CH : si un raccourci est mal "unpacké",
- * la distance peut être correcte mais le chemin retourné peut être
- * faux (sauter des nœuds, ou utiliser une arête inexistante du graphe
- * original). On ne s'en rendrait pas compte en regardant juste la dist.
- *
- * Renvoie 1 si OK, 0 sinon (et écrit la cause sur stderr).
- */
+/* Validation d'un chemin reconstruit */
+
 static int validate_path(const CSRGraph *g,
                           const int *path, int len,
                           double expected_dist,
@@ -2055,7 +1549,6 @@ static int validate_path(const CSRGraph *g,
         fprintf(stderr, "  [ERR] %s : chemin vide\n", who); return 0;
     }
     if (len == 1) {
-        /* source == target : ok ssi expected_dist ~= 0 */
         if (fabs(expected_dist) > 1e-3) {
             fprintf(stderr, "  [ERR] %s : chemin de 1 nœud mais dist=%.3f\n",
                     who, expected_dist);
@@ -2070,8 +1563,7 @@ static int validate_path(const CSRGraph *g,
             fprintf(stderr, "  [ERR] %s : nœud hors-borne à i=%d\n", who, i);
             return 0;
         }
-        /* Cherche la meilleure arête u→v dans G (on prend la plus courte
-         * en cas de doublons, peu probable ici) */
+        /* Cherche la meilleure arête u→v dans G (on prend la plus courte en cas de doublons) */
         double best = DBL_MAX;
         for (int k = g->row_ptr[u]; k < g->row_ptr[u + 1]; k++)
             if (g->adj[k] == v && g->weights[k] < best) best = g->weights[k];
@@ -2092,7 +1584,7 @@ static int validate_path(const CSRGraph *g,
 }
 
 
-/* ─── 16.3 Statistiques (moyenne, p50, p95, débit) ─────────────────────── */
+/*Statistiques (moyenne, p50, p95, débit)*/
 
 static int cmp_double(const void *a, const void *b) {
     double da = *(const double *)a, db = *(const double *)b;
@@ -2110,8 +1602,6 @@ typedef struct {
 
 /*
  * Calcule les stats à partir d'un tableau de temps (en ms).
- * Modifie le tableau (qsort en place) — c'est OK car on l'a déjà
- * exploité par ailleurs. Si non, faire une copie au préalable.
  */
 static TimeStats compute_stats(double *times_ms, int n) {
     TimeStats s = {0};
@@ -2122,7 +1612,6 @@ static TimeStats compute_stats(double *times_ms, int n) {
     s.mean_ms  = sum / n;
     s.total_ms = sum;
     qsort(times_ms, n, sizeof(double), cmp_double);
-    /* Percentile par "nearest-rank" : indice = ceil(p/100 × n) − 1 */
     int i50 = (int)ceil(0.50 * n) - 1; if (i50 < 0) i50 = 0;
     int i95 = (int)ceil(0.95 * n) - 1; if (i95 < 0) i95 = 0;
     s.p50_ms = times_ms[i50];
@@ -2132,16 +1621,14 @@ static TimeStats compute_stats(double *times_ms, int n) {
 }
 
 
-/* ─── 16.4 Classification des requêtes par distance ────────────────────── */
+/* Classification des requêtes par distance */
 /*
  * On classe les requêtes en 3 catégories selon la distance Dijkstra :
  *   SHORT  : distance < 20 km   (intra-ville/agglo)
  *   MEDIUM : 20 - 80 km          (inter-villes courtes)
  *   LONG   : > 80 km             (régional)
  *
- * Ces seuils sont calibrés pour un graphe régional comme la
- * Champagne-Ardenne (≈ 200 km de diagonale). À adapter pour une
- * autre échelle : ville (ex. 1 / 5 km), pays (ex. 50 / 200 km).
+ * Ces seuils sont calibrés pour un graphe régional comme la Champagne-Ardenne.
  */
 typedef enum { CAT_SHORT = 0, CAT_MEDIUM = 1, CAT_LONG = 2, CAT_N = 3 } Category;
 static const char *CAT_NAMES[CAT_N] = {"SHORT", "MEDIUM", "LONG"};
@@ -2153,9 +1640,7 @@ static Category classify_distance(double dist_m) {
 }
 
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * SECTION 17 — PROGRAMME PRINCIPAL
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* Main */
 
 int main(int argc, char *argv[]) {
     Config cfg = parse_args(argc, argv);
@@ -2168,7 +1653,7 @@ int main(int argc, char *argv[]) {
     if (cfg.csv_out) printf("    csv=%s\n", cfg.csv_out);
     printf("\n");
 
-    /* ── [1/4] Chargement et CSR ── */
+    /* Chargement et CSR */
     int      n_nodes;
     HashMap *map;
     printf("[1/4] Lecture de %s ...\n", cfg.nodes_path);
@@ -2196,7 +1681,7 @@ int main(int argc, char *argv[]) {
     printf("      Mémoire graphes : %.1f Mo\n", mem_csr / (1024.0 * 1024.0));
 
 
-    /* ── [4/4] Prétraitement ALT et CH ── */
+    /* Prétraitement ALT et CH */
     printf("\n[4/4] Prétraitements\n");
     printf("  > ALT (%d landmarks)\n", cfg.num_landmarks);
     ALTData *alt = alt_preprocess(g, g_rev, cfg.num_landmarks, cfg.seed);
@@ -2217,7 +1702,7 @@ int main(int argc, char *argv[]) {
     }
 
 
-    /* ── Génération du lot de requêtes ── */
+    /* Génération du lot de requêtes */
     int N = cfg.num_queries;
     srand(cfg.seed);
     int *src = malloc(N * sizeof(int));
@@ -2228,8 +1713,7 @@ int main(int argc, char *argv[]) {
     }
 
 
-    /* ── Stockage des temps et résultats par requête ── */
-    /* Indexation : [algo][query]. ALGO = 0 Dijkstra, 1 A*, 2 ALT, 3 CH. */
+    /* Stockage des temps et résultats par requête */
     #define ALGO_N 4
     const char *ALGO_NAMES[ALGO_N] = {"Dijkstra", "A*", "ALT", "CH"};
     double *times[ALGO_N];
@@ -2248,7 +1732,7 @@ int main(int argc, char *argv[]) {
     int       cat_count[CAT_N] = {0, 0, 0};
 
 
-    /* ── Benchmark ── */
+    /*Benchmark*/
     printf("\n=== Benchmark sur %d requêtes ===\n", N);
     int errors = 0;
     int progress = N / 20 > 1 ? N / 20 : 1;
@@ -2272,7 +1756,7 @@ int main(int argc, char *argv[]) {
 
         /* Vérification : Dijkstra est la référence */
         if (r_dij.dist < 0) {
-            cats[q] = CAT_SHORT;     /* arbitraire : non comptabilisé */
+            cats[q] = CAT_SHORT;
             goto cleanup_q;
         }
         valid_q++;
@@ -2300,7 +1784,6 @@ int main(int argc, char *argv[]) {
                 errors++;
             }
         }
-        /* Validation chemin Dijkstra aussi (sanity check) */
         if (!validate_path(g, r_dij.path, r_dij.path_len,
                              r_dij.dist, "Dijkstra")) {
             errors++;
@@ -2320,10 +1803,6 @@ cleanup_q:
     else
         printf("\n  [%d ERREURS] détectées (voir stderr)\n", errors);
 
-
-    /* ─────────────────────────────────────────────────────────────────
-     * RÉCAPITULATIF GLOBAL : moyenne / p50 / p95 / débit / nœuds
-     * ───────────────────────────────────────────────────────────────── */
     printf("\n=== Récapitulatif global (%d requêtes valides sur %d) ===\n",
            valid_q, N);
     printf("  Algo     |  moy (ms) |  p50 (ms) |  p95 (ms) |   req/s  | nœuds expl. moy | xDijk\n");
@@ -2339,7 +1818,7 @@ cleanup_q:
         if (a == 3 && !ch) continue;
         int k = 0;
         for (int q = 0; q < N; q++) {
-            if (dists[0][q] < 0) continue;     /* Dijkstra inaccessible : skip */
+            if (dists[0][q] < 0) continue;
             tmp_times[k++] = times[a][q];
             sum_explor[a] += explor[a][q];
         }
@@ -2360,9 +1839,7 @@ cleanup_q:
     }
 
 
-    /* ─────────────────────────────────────────────────────────────────
-     * STATS PAR CATÉGORIE (SHORT / MEDIUM / LONG)
-     * ───────────────────────────────────────────────────────────────── */
+    /* STATS PAR CATÉGORIE (SHORT / MEDIUM / LONG) */
     printf("\n=== Stats par catégorie de distance ===\n");
     printf("  Seuils : SHORT < 20km , MEDIUM 20-80km , LONG > 80km\n");
     printf("  Effectifs : SHORT=%d  MEDIUM=%d  LONG=%d\n",
@@ -2397,9 +1874,7 @@ cleanup_q:
     free(tmp);
 
 
-    /* ─────────────────────────────────────────────────────────────────
-     * COÛTS DE PRÉTRAITEMENT
-     * ───────────────────────────────────────────────────────────────── */
+    /*COÛTS DE PRÉTRAITEMENT*/
     printf("\n=== Prétraitement et mémoire ===\n");
     printf("  Graphe CSR (G + G' + nodes) : %.1f Mo\n", mem_csr / (1024.0 * 1024.0));
     printf("  ALT : %.1f ms , %.1f Mo (%d landmarks)\n",
@@ -2414,9 +1889,7 @@ cleanup_q:
     }
 
 
-    /* ─────────────────────────────────────────────────────────────────
-     * EXPORT CSV (1 ligne par requête × algo)
-     * ───────────────────────────────────────────────────────────────── */
+    /* EXPORT CSV */
     if (cfg.csv_out) {
         FILE *fcsv = fopen(cfg.csv_out, "w");
         if (!fcsv) {
@@ -2426,7 +1899,7 @@ cleanup_q:
                 "query_id,source,target,category,algo,"
                 "dist_m,nodes_explored,relaxations,time_ms\n");
             for (int q = 0; q < N; q++) {
-                if (dists[0][q] < 0) continue;     /* on n'écrit que les valides */
+                if (dists[0][q] < 0) continue;
                 const char *catstr = CAT_NAMES[cats[q]];
                 for (int a = 0; a < ALGO_N; a++) {
                     if (a == 3 && !ch) continue;
