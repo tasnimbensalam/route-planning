@@ -124,18 +124,13 @@ Le script filtre les voies carrossables (`motorway`, `trunk`, `primary`, `second
 
 ```bash
 # Compilation standard (recommandée)
-gcc -O2 -Wall -Wextra -o route_planning load_graph.c -lm
-
-# Avec sanitizers (débogage / validation)
-gcc -O1 -fsanitize=address,undefined -o route_planning_dbg load_graph.c -lm
-```
-
+gcc -O2 -Wall -Wextra -o load_graph load_graph.c -lm
 ---
 
 ## Utilisation
 
 ```
-./route_planning [OPTIONS]
+./load_graph [OPTIONS]
 ```
 
 ### Options
@@ -154,18 +149,18 @@ gcc -O1 -fsanitize=address,undefined -o route_planning_dbg load_graph.c -lm
 
 ```bash
 # Benchmark complet avec paramètres par défaut
-./route_planning
+./load_graph
 
 # Benchmark rapide sans CH (pas de prétraitement de 65 s)
-./route_planning --no-ch --queries 500
+./load_graph --no-ch --queries 500
 
 # Étude de l'effet du nombre de landmarks
-./route_planning --no-ch --landmarks 8
-./route_planning --no-ch --landmarks 16
-./route_planning --no-ch --landmarks 32
+./load_graph --no-ch --landmarks 8
+./load_graph --no-ch --landmarks 16
+./load_graph --no-ch --landmarks 32
 
 # Export CSV pour analyse externe (Python, R…)
-./route_planning --csv resultats.csv
+./load_graph --csv resultats.csv
 ```
 ### commande pour lance 
 compiler gcc -O2 -o load_graph load_graph.c -lm        
