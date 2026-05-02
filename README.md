@@ -129,7 +129,7 @@ gcc -O2 -Wall -Wextra -o load_graph load_graph.c -lm
 
 ## Utilisation
 
-```
+```bash
 ./load_graph [OPTIONS]
 ```
 
